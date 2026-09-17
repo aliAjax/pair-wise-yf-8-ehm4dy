@@ -134,6 +134,32 @@ function findTune(db, tuneId) {
   return tune;
 }
 
+function getCheckBlockers(db, section) {
+  const reasons = [];
+  const openIssues = db.issues.filter(
+    (item) => item.sectionId === section.id && item.status !== "resolved"
+  );
+  if (openIssues.length > 0) {
+    reasons.push(`区间仍有 ${openIssues.length} 个未解决问题，需全部解决后才能核对`);
+  }
+  const uncheckedEarlier = db.sections
+    .filter(
+      (item) =>
+        item.tuneId === section.tuneId &&
+        item.id !== section.id &&
+        item.startBeat < section.startBeat &&
+        !item.checked
+    )
+    .sort((a, b) => a.startBeat - b.startBeat || a.endBeat - b.endBeat);
+  if (uncheckedEarlier.length > 0) {
+    const desc = uncheckedEarlier
+      .map((item) => `第${item.startBeat}拍起的区间 ${item.id}`)
+      .join("、");
+    reasons.push(`仍有起始拍更早的区间未核对：${desc}`);
+  }
+  return reasons;
+}
+
 function buildProgress(db, tuneId) {
   findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
@@ -222,7 +248,19 @@ async function handle(req, res) {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
     if (!section) return send(res, 404, { error: "区间不存在" });
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const targetChecked = body.checked !== undefined ? Boolean(body.checked) : true;
+    // 仅在标记为已核对时做前置校验；取消核对始终允许
+    if (targetChecked) {
+      const reasons = getCheckBlockers(db, section);
+      if (reasons.length > 0) {
+        return send(res, 409, {
+          error: "核对条件不满足",
+          reasons,
+          data: section
+        });
+      }
+    }
+    section.checked = targetChecked;
     section.note = body.note ?? section.note;
     await writeDb(db);
     return send(res, 200, { data: section });
@@ -254,8 +292,13 @@ async function handle(req, res) {
       resolvedAt: null
     };
     db.issues.push(issue);
+    // 已核对区间新增问题后自动恢复待核对；解决问题后不自动通过，需重新试奏并手动核对
+    const sectionReverted = section.checked;
+    if (sectionReverted) {
+      section.checked = false;
+    }
     await writeDb(db);
-    return send(res, 201, { data: issue });
+    return send(res, 201, { data: issue, revertedSection: sectionReverted });
   }
 
   const issueStatusMatch = pathname.match(/^\/issues\/([^/]+)\/status$/);
@@ -267,6 +310,7 @@ async function handle(req, res) {
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+    // 只更新问题状态：即使最后一个问题解决，区间也保持待核对，需重新试奏后通过 check 接口核对
     await writeDb(db);
     return send(res, 200, { data: issue });
   }
