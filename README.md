@@ -22,6 +22,18 @@ PORT=3019 node server.js
 - `POST /issues`
 - `PATCH /issues/:id/status`
 
+## 试奏核对闭环
+
+- `PATCH /sections/:id/check`（请求体 `{"checked":true}` 或省略）只有在以下条件都满足时才能把区间标记为已核对：
+  1. 该区间下没有未解决问题（`status !== "resolved"`）；
+  2. 同一曲目内所有起始拍（`startBeat`）更早的区间都已核对。
+- 条件不满足时返回 `409`，响应体包含 `error` 和结构化 `reasons`（`open_issues` / `earlier_sections_unchecked`，附相关 id 列表），区间核对状态与备注保持不变。
+- `{"checked":false}` 取消核对不受门槛限制。
+- 已核对区间一旦出现未解决问题（`POST /issues` 新增，或 `PATCH /issues/:id/status` 把已解决问题重新打开），自动恢复为待核对（响应 `meta.sectionRevertedToUnchecked: true`）。
+- 最后一个问题解决后区间**不会**自动通过，必须再次显式调用 check 接口重新核对。
+- 新建区间一律以待核对开始（创建时传入的 `checked` 字段被忽略）。
+- `GET /tunes/:id/progress` 始终按真实的已核对区间数统计，自动回退后进度立即下降。
+
 ## 闭环示例
 
 ```bash

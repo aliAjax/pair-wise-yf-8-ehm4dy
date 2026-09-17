@@ -151,6 +151,43 @@ function buildProgress(db, tuneId) {
   };
 }
 
+// 试奏核对门槛：区间内未解决问题必须全部解决，且起始拍更早的区间都已核对
+function getCheckBlockers(db, section) {
+  const blockers = [];
+  const openIssues = db.issues.filter(
+    (item) => item.sectionId === section.id && item.status !== "resolved"
+  );
+  if (openIssues.length) {
+    blockers.push({
+      code: "open_issues",
+      message: `仍有 ${openIssues.length} 个未解决问题，全部解决后才能标记已核对`,
+      issueIds: openIssues.map((item) => item.id)
+    });
+  }
+  const earlierUnchecked = db.sections.filter(
+    (item) =>
+      item.tuneId === section.tuneId &&
+      item.id !== section.id &&
+      Number(item.startBeat) < Number(section.startBeat) &&
+      !item.checked
+  );
+  if (earlierUnchecked.length) {
+    blockers.push({
+      code: "earlier_sections_unchecked",
+      message: `有 ${earlierUnchecked.length} 个起始拍更早的区间尚未核对，需按顺序核对`,
+      sectionIds: earlierUnchecked.map((item) => item.id)
+    });
+  }
+  return blockers;
+}
+
+// 已核对区间出现未解决问题时自动恢复待核对（新增问题、重新打开问题均适用）
+function revertCheckedSection(section) {
+  if (!section || !section.checked) return false;
+  section.checked = false;
+  return true;
+}
+
 async function handle(req, res) {
   const { pathname, searchParams } = parseUrl(req);
   const db = await readDb();
@@ -197,7 +234,8 @@ async function handle(req, res) {
       startBeat: Number(body.startBeat),
       endBeat: Number(body.endBeat),
       laneRange: body.laneRange,
-      checked: Boolean(body.checked),
+      // 新区间必须经过试奏核对闭环，不能创建时直接标记已核对
+      checked: false,
       note: body.note || ""
     };
     db.sections.push(section);
@@ -222,7 +260,22 @@ async function handle(req, res) {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
     if (!section) return send(res, 404, { error: "区间不存在" });
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const targetChecked = body.checked !== undefined ? Boolean(body.checked) : true;
+
+    // 取消核对不设门槛；标记已核对必须通过试奏核对闭环
+    if (targetChecked) {
+      const blockers = getCheckBlockers(db, section);
+      if (blockers.length) {
+        // 核对状态不变，备注也不改动
+        return send(res, 409, {
+          error: "暂不能标记已核对",
+          reasons: blockers,
+          data: section
+        });
+      }
+    }
+
+    section.checked = targetChecked;
     section.note = body.note ?? section.note;
     await writeDb(db);
     return send(res, 200, { data: section });
@@ -254,8 +307,10 @@ async function handle(req, res) {
       resolvedAt: null
     };
     db.issues.push(issue);
+    // 已核对区间新增问题后自动恢复待核对，最后一个问题解决也不会自动通过
+    const revertedToUnchecked = revertCheckedSection(section);
     await writeDb(db);
-    return send(res, 201, { data: issue });
+    return send(res, 201, { data: issue, meta: { sectionRevertedToUnchecked: revertedToUnchecked } });
   }
 
   const issueStatusMatch = pathname.match(/^\/issues\/([^/]+)\/status$/);
@@ -267,8 +322,14 @@ async function handle(req, res) {
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+
+    // 问题重新打开（未解决）时，所属已核对区间自动恢复待核对；
+    // 问题解决不自动标记已核对，需再次显式 PATCH /sections/:id/check
+    const section = db.sections.find((item) => item.id === issue.sectionId);
+    const revertedToUnchecked =
+      body.status !== "resolved" ? revertCheckedSection(section) : false;
     await writeDb(db);
-    return send(res, 200, { data: issue });
+    return send(res, 200, { data: issue, meta: { sectionRevertedToUnchecked: revertedToUnchecked } });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
